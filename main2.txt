@@ -1,0 +1,441 @@
+#include <Arduino.h>
+#include "pico/multicore.h" // Для работы с двумя ядрами
+#define CANARD_MTU 8
+extern "C" {
+    #include "can2040.h"
+    #include "actuator.ArrayCommand.h"
+}
+#include "canard.h"
+#include "canard_internals.h"
+#include <SimpleFOC.h>
+#include "pico/time.h"
+#include <queue>
+#include <map>
+#include <vector>
+std::queue<CanardCANFrame> rxQueue;
+
+// --- Конфигурация CAN ---
+#define CAN_RX_PIN 8
+#define CAN_TX_PIN 9
+#define CAN_BITRATE 1000000 // 1 Mbps
+#define NODESTATUS_PERIOD_MS 1000
+
+// --- Переменные ---
+unsigned long last_nodestatus_time = 0;
+static uint8_t transfer_id = 0;
+int value_can_tangle = 0;
+
+const int endstopPin = 11;
+
+// --- SimpleFOC ---
+BLDCMotor motor = BLDCMotor(7);
+BLDCDriver3PWM driver = BLDCDriver3PWM(28, 27, 26, 15);
+MagneticSensorI2C sensor = MagneticSensorI2C(AS5600_I2C);
+
+double target_angle = 0;
+int pwmMin = 0;     
+int pwmMax = 1000;     
+double angleMin = 0;      
+double angleMax = 21;
+uint64_t timestamp = micros();
+// --- CAN ---
+static struct can2040 can_dev;
+static struct can2040_stats stats;
+static CanardInstance canard;
+struct MultiFrameBuffer {
+    std::map<uint32_t, std::vector<uint8_t>> message_parts; // Буфер для хранения частей сообщений
+    std::map<uint32_t, uint8_t> received_parts; // Количество полученных частей
+    std::map<uint32_t, uint8_t> expected_parts; // Общее количество частей
+};
+uint32_t expected_frame_id = 0x9403F27F;
+MultiFrameBuffer multi_frame_buffer;
+
+const size_t MAX_FRAME_SIZE = 8;  // Например, 8 байт на кадр
+
+void processMultiFrame(uint32_t message_id, const uint8_t* data, uint8_t dlc) {
+    Serial.println("Entering processMultiFrame");
+
+    // Проверка минимальной длины DLC
+    if (dlc < 1) {
+        Serial.println("Error: DLC too short.");
+        return;
+    }
+    auto& buffer = multi_frame_buffer;
+    const uint32_t min_frame_id = 0x9403F200; // Минимальное значение ID
+    const uint32_t max_frame_id = 0x9403F2FF; // Максимальное значение ID
+    if (message_id < min_frame_id || message_id > max_frame_id) {
+        Serial.println("Not an ArrayCommand frame.");
+        return;
+    }
+    Serial.print("Data: ");
+        for (uint8_t i = 0; i < dlc; ++i) {
+            Serial.print(data[i], HEX);
+            Serial.print(" ");
+        }
+    
+    Serial.println();
+    // Определение первого кадра мультикадрового сообщения
+    if (dlc == 8) {
+        Serial.println("Detected first frame of multi-frame message.");
+
+        // Инициализация буфера для нового сообщения
+        buffer.message_parts[message_id].clear();
+        buffer.expected_parts[message_id] = 0; // Пока не знаем общий размер
+        buffer.received_parts[message_id] = 0;
+        timestamp = micros();
+        // Сохраняем данные первого кадра
+        buffer.message_parts[message_id].insert(
+            buffer.message_parts[message_id].end(),
+            data,
+            data + dlc);
+        buffer.received_parts[message_id] += dlc;
+        return;
+    }
+
+    // Обработка последующих кадров
+    if (dlc == 4) {
+        Serial.println("Detected continuation frame of multi-frame message.");
+
+        if (buffer.message_parts.find(message_id) == buffer.message_parts.end()) {
+            Serial.println("Error: Received frame for unknown multi-frame message.");
+            return;
+        }
+        
+        // Сохраняем данные из продолжения
+        buffer.message_parts[message_id].insert(
+            buffer.message_parts[message_id].end(),
+            data,
+            data + dlc);
+        buffer.received_parts[message_id] += dlc;
+
+        // Проверка завершения (например, по количеству данных)
+        if (buffer.received_parts[message_id] >= 8 + buffer.expected_parts[message_id]) {
+            Serial.println("Multi-frame message complete.");
+            const std::vector<uint8_t>& complete_message = buffer.message_parts[message_id];
+            
+            // Разделяем сообщение на части и отправляем в libcanard
+            size_t offset = 0;
+            while (offset < complete_message.size()) {
+                CanardCANFrame frame;
+                frame.id = message_id;
+
+                // Определяем длину текущего кадра (максимум 8 байт)
+                frame.data_len = std::min<size_t>(complete_message.size() - offset, 8);
+                memcpy(frame.data, &complete_message[offset], frame.data_len);
+
+                Serial.print("Sending frame: ID=");
+                Serial.println(frame.id, HEX);
+                Serial.print("Data: ");
+                for (size_t i = 0; i < frame.data_len; ++i) {
+                    Serial.print(frame.data[i], HEX);
+                    Serial.print(" ");
+                }
+                Serial.println();
+                Serial.print("Length: ");
+                Serial.println(frame.data_len);
+                for (size_t i = 0; i < complete_message.size(); ++i) {
+                    Serial.print(complete_message[i]);
+                    Serial.print(" ");
+                }
+                Serial.println();
+                Serial.print("timestamp: ");
+                Serial.println(timestamp);
+                int16_t result = canardHandleRxFrame(&canard, &frame, timestamp);
+                if (result < 0) {
+                    Serial.print("Error in canardHandleRxFrame: ");
+                    Serial.println(result);
+                    Serial.print("Frame ID: ");
+                    Serial.println(frame.id);
+                    Serial.print("Frame Data Length: ");
+                    Serial.println(frame.data_len);
+                } else {
+                Serial.println("Frame received successfully!");
+                // Дополнительная отладка фрейма
+                Serial.print("Frame ID: ");
+                Serial.println(frame.id);
+                Serial.print("Frame Data Length: ");
+                Serial.println(frame.data_len);
+            }
+                offset += frame.data_len;
+            }
+
+            // Очистка буфера
+            buffer.message_parts.erase(message_id);
+            buffer.received_parts.erase(message_id);
+            buffer.expected_parts.erase(message_id);
+
+            Serial.println("Multi-frame message processed and buffer cleared.");
+        }
+        return;
+    }
+
+    // Если формат кадра неизвестен
+    Serial.println("Error: Unknown frame format.");
+}
+
+
+
+// --- Функции CAN ---
+void stat(){
+    can2040_get_statistics(&can_dev,&stats);
+    //Serial.println("*******************Stat RX-TX********************");
+    //Serial.print("TX Stat: ");
+    //Serial.println(stats.tx_total);
+    //Serial.print("RX Stat: ");
+    //Serial.println(stats.rx_total);
+    //Serial.print("TX ATTemot: ");
+    //Serial.println(stats.tx_attempt);
+    //Serial.print("Parse error: ");
+    //Serial.println(stats.parse_error);
+}
+
+uint64_t getCurrentTimeMicros() {
+    return time_us_64(); // Возвращает текущее время в микросекундах
+}
+void sendNodeStatus() {
+    struct NodeStatusMessage {
+        uint32_t uptime_sec;          // Время работы узла в секундах
+        uint8_t health_mode;          // health (2 бита) + mode (3 бита) + sub_mode (3 бита)
+        uint16_t vendor_status_code;  // Код состояния
+    } __attribute__((packed));
+
+    static uint32_t uptime_sec = 0;
+    uptime_sec++;
+
+    // Упакуем health, mode и sub_mode в один байт (2 + 3 + 3 бита)
+    uint8_t health = 0; // HEALTH_OK
+    uint8_t mode = 0;   // MODE_OPERATIONAL
+    uint8_t sub_mode = 0;
+    uint8_t health_mode = (health << 6) | (mode << 3) | sub_mode;
+
+    NodeStatusMessage status = {
+        .uptime_sec = uptime_sec,
+        .health_mode = health_mode,
+        .vendor_status_code = 0  // Код состояния
+    };
+
+    CanardTxTransfer transfer;
+    canardInitTxTransfer(&transfer);
+    transfer.transfer_type = CanardTransferTypeBroadcast;
+    transfer.data_type_id = 341; // NodeStatus
+    transfer.inout_transfer_id = &transfer_id;
+    transfer.payload = reinterpret_cast<const uint8_t*>(&status);
+    transfer.payload_len = sizeof(status);
+    transfer.priority = CANARD_TRANSFER_PRIORITY_LOW;
+
+    int16_t result = canardBroadcastObj(&canard, &transfer);
+
+    if (result < 0) {
+       Serial.print("Error sending NodeStatus: ");
+       Serial.println(result);
+    } else {
+       Serial.println("NodeStatus sent successfully");
+    }
+}
+void onReceptionCallback(CanardInstance* ins, CanardRxTransfer* transfer) {
+    //Serial.println("**********************************");
+    Serial.print("NODE ID: ");
+    Serial.println(transfer->source_node_id);
+    Serial.print("Received Data Type ID: ");
+    Serial.println(transfer->data_type_id);
+    //Serial.print("Transfer type: ");
+    //Serial.println(transfer->transfer_type);
+    //Serial.println("**********************************");
+    if (transfer->data_type_id == ACTUATOR_ARRAYCOMMAND_ID) {
+       // //Serial.println("Received ArrayCommand message.");
+
+        // Декодируем сообщение
+        actuator_ArrayCommand array_command;
+        bool decode_failed = actuator_ArrayCommand_decode(transfer, &array_command);
+
+        if (decode_failed) {
+            //Serial.println("Failed to decode ArrayCommand!");
+            return;
+        }
+
+        // Выводим количество команд в сообщении
+       Serial.print("Number of commands: ");
+       Serial.println(array_command.commands.len);
+
+        // Перебираем и выводим все команды
+        for (uint8_t i = 0; i < array_command.commands.len; i++) {
+           Serial.print("Command ");
+           Serial.print(i);
+           Serial.print(": ID = ");
+           Serial.print(array_command.commands.data[i].actuator_id);  // Поле ID команды
+           Serial.print(", Value = ");
+           Serial.println((int)(array_command.commands.data[i].command_value*1000));  // Поле Value команды
+            value_can_tangle = (int)(array_command.commands.data[i].command_value*1000);
+        }
+    }
+    else if(transfer->data_type_id == 1030){
+    Serial.println("**********************************");
+    Serial.print("NODE ID: ");
+    Serial.println(transfer->source_node_id);
+    Serial.print("Received Data Type ID: ");
+    Serial.println(transfer->data_type_id);
+    Serial.print("Transfer type: ");
+    Serial.println(transfer->transfer_type);
+    Serial.println("**********************************");
+    }
+}
+
+bool shouldAcceptCallback(const CanardInstance* ins, uint64_t* data_type_signature, uint16_t data_type_id, CanardTransferType transfer_type, uint8_t source_node_id) {
+    if (data_type_id == 1010) {
+        *data_type_signature = ACTUATOR_ARRAYCOMMAND_SIGNATURE;
+        return true;
+    }
+    if (data_type_id == 1030){
+        return true;
+    }
+    return false;
+    //return true;
+}
+void processRxQueue() {
+    while (!rxQueue.empty()) {
+        CanardCANFrame frame = rxQueue.front();
+        rxQueue.pop();
+
+        // Обрабатываем фрейм через libcanard
+        int16_t result = canardHandleRxFrame(&canard, &frame, micros());
+        if (result < 0) {
+            Serial.print("Error in canardHandleRxFrame: ");
+            Serial.println(result);
+        }
+    }
+}
+void can2040_rx_callback(struct can2040* cd, uint32_t notify, struct can2040_msg* msg) {
+    if (notify & CAN2040_NOTIFY_RX) {
+        Serial.println("Test1");
+        uint32_t message_id = msg->id;
+        Serial.println((message_id));
+        processMultiFrame((message_id), msg->data, msg->dlc);
+    }
+   /*if (notify & CAN2040_NOTIFY_RX) {
+        Serial.print("Raw CAN Frame ID: ");
+        Serial.println(msg->id, HEX);
+        Serial.print("DLC: ");
+        Serial.println(msg->dlc);
+        Serial.print("Data: ");
+        for (uint8_t i = 0; i < msg->dlc; ++i) {
+            Serial.print(msg->data[i], HEX);
+            Serial.print(" ");
+        }
+        Serial.println();
+    }*/
+}
+void PIOx_IRQHandler() {
+    can2040_pio_irq_handler(&can_dev);
+}
+double mapDouble(double x, double in_min, double in_max, double out_min, double out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+// --- Поток для управления мотором ---
+void motorTask() {
+    pinMode(endstopPin, INPUT_PULLUP);
+    analogWriteFreq(25000);   
+    sensor.init();
+    motor.linkSensor(&sensor);
+
+    driver.voltage_power_supply = 16;
+    driver.voltage_limit = 12;
+    driver.init();
+    motor.linkDriver(&driver);
+    motor.foc_modulation = FOCModulationType::SpaceVectorPWM;
+    motor.torque_controller = TorqueControlType::voltage;
+    motor.controller = MotionControlType::angle;
+
+    motor.PID_velocity.P = 0.2;
+    motor.PID_velocity.I = 0.2;
+    motor.PID_velocity.D = 0.0001;
+    motor.LPF_velocity.Tf = 0.12;
+    motor.velocity_limit = 25;
+    motor.current_limit = 1;
+    motor.voltage_limit = 11;
+    motor.init();
+    motor.initFOC();
+
+    float search_speed = 100;
+    motor.move(search_speed);
+
+    while (digitalRead(endstopPin) == HIGH) { 
+        motor.loopFOC();
+        motor.move(search_speed);
+        delay(10);
+    }
+
+    motor.move(0);
+    sensor.update(); 
+    float initial_position = -sensor.getAngle(); 
+    angleMin = initial_position; 
+    angleMax = angleMin - 21; 
+    //Serial.println("Motor ready");
+
+    while (true) {
+        motor.loopFOC();
+        motor.monitor();
+        if (value_can_tangle == 0) {
+            target_angle = (angleMin - 18);
+        } else {
+            target_angle = mapDouble(value_can_tangle, pwmMin, pwmMax, angleMin, angleMax);
+        }
+        motor.move(target_angle);
+    }
+}
+
+// --- Поток для CAN ---
+void canTask() {
+    uint8_t canard_memory_pool[131072];
+    
+
+    can2040_setup(&can_dev, 0);
+    can2040_callback_config(&can_dev, can2040_rx_callback);
+    can2040_start(&can_dev, 125000000, CAN_BITRATE, CAN_RX_PIN, CAN_TX_PIN);
+    irq_set_exclusive_handler(PIO0_IRQ_0, PIOx_IRQHandler);
+    irq_set_enabled(PIO0_IRQ_0, true);
+    
+    canardInit(&canard, canard_memory_pool, sizeof(canard_memory_pool), onReceptionCallback, shouldAcceptCallback, nullptr);
+    canard.node_id = 42;
+    //Serial.println("CAN initialized.");
+    CanardPoolAllocatorStatistics stats = canardGetPoolAllocatorStatistics(&canard);
+    while (true) {
+        if (millis() - last_nodestatus_time >= NODESTATUS_PERIOD_MS) {
+        sendNodeStatus();
+        last_nodestatus_time = millis();
+    }
+    processRxQueue();
+    /*//Serial.println("************Memory used*************");
+    //Serial.print("Capacity: ");
+    //Serial.println(stats.capacity_blocks);
+    //Serial.print("Used: ");
+    //Serial.println(stats.current_usage_blocks);
+    //Serial.print("Peak: ");
+    //Serial.println(stats.peak_usage_blocks);*/
+    // Transmit CAN frames in the queue
+    for (CanardCANFrame* txf = canardPeekTxQueue(&canard); txf != NULL; txf = canardPeekTxQueue(&canard)) {
+        struct can2040_msg msg;
+        msg.id = txf->id;
+        memcpy(msg.data, txf->data, txf->data_len);
+        msg.dlc = txf->data_len;
+        can2040_transmit(&can_dev, &msg);
+        canardPopTxQueue(&canard);
+    }
+    }
+}
+
+// --- Основной setup ---
+void setup() {
+    Serial.begin(115200);
+    set_sys_clock_khz(125000, true);
+
+    // Запускаем motorTask на втором ядре
+    multicore_launch_core1(canTask);
+
+    // Запускаем canTask на основном ядре
+    motorTask();
+}
+
+// --- Основной loop (не используется) ---
+void loop() {
+    // Всё выполняется в потоках
+}
